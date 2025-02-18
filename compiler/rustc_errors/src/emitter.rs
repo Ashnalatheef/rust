@@ -14,10 +14,11 @@ use std::io::prelude::*;
 use std::io::{self, IsTerminal};
 use std::iter;
 use std::path::Path;
+use std::sync::Arc;
 
 use derive_setters::Setters;
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap, FxIndexSet};
-use rustc_data_structures::sync::{DynSend, IntoDynSyncSend, Lrc};
+use rustc_data_structures::sync::{DynSend, IntoDynSyncSend};
 use rustc_error_messages::{FluentArgs, SpanLabel};
 use rustc_lexer;
 use rustc_lint_defs::pluralize;
@@ -610,8 +611,8 @@ pub enum OutputTheme {
 pub struct HumanEmitter {
     #[setters(skip)]
     dst: IntoDynSyncSend<Destination>,
-    sm: Option<Lrc<SourceMap>>,
-    fluent_bundle: Option<Lrc<FluentBundle>>,
+    sm: Option<Arc<SourceMap>>,
+    fluent_bundle: Option<Arc<FluentBundle>>,
     #[setters(skip)]
     fallback_bundle: LazyFallbackBundle,
     short_message: bool,
@@ -628,7 +629,7 @@ pub struct HumanEmitter {
 
 #[derive(Debug)]
 pub(crate) struct FileWithAnnotatedLines {
-    pub(crate) file: Lrc<SourceFile>,
+    pub(crate) file: Arc<SourceFile>,
     pub(crate) lines: Vec<Line>,
     multiline_depth: usize,
 }
@@ -712,7 +713,7 @@ impl HumanEmitter {
     fn render_source_line(
         &self,
         buffer: &mut StyledBuffer,
-        file: Lrc<SourceFile>,
+        file: Arc<SourceFile>,
         line: &Line,
         width_offset: usize,
         code_offset: usize,
@@ -1691,7 +1692,7 @@ impl HumanEmitter {
                 // Get the left-side margin to remove it
                 let mut whitespace_margin = usize::MAX;
                 for line_idx in 0..annotated_file.lines.len() {
-                    let file = Lrc::clone(&annotated_file.file);
+                    let file = Arc::clone(&annotated_file.file);
                     let line = &annotated_file.lines[line_idx];
                     if let Some(source_string) =
                         line.line_index.checked_sub(1).and_then(|l| file.get_line(l))
@@ -1764,7 +1765,7 @@ impl HumanEmitter {
 
                 let column_width = if let Some(width) = self.diagnostic_width {
                     width.saturating_sub(code_offset)
-                } else if self.ui_testing {
+                } else if self.ui_testing || cfg!(miri) {
                     DEFAULT_COLUMN_WIDTH
                 } else {
                     termize::dimensions()
@@ -1787,7 +1788,7 @@ impl HumanEmitter {
 
                     let depths = self.render_source_line(
                         &mut buffer,
-                        Lrc::clone(&annotated_file.file),
+                        Arc::clone(&annotated_file.file),
                         &annotated_file.lines[line_idx],
                         width_offset,
                         code_offset,
@@ -1975,13 +1976,16 @@ impl HumanEmitter {
             Some(Style::HeaderMsg),
         );
 
+        let other_suggestions = suggestions.len().saturating_sub(MAX_SUGGESTIONS);
+
         let mut row_num = 2;
         for (i, (complete, parts, highlights, _)) in
-            suggestions.iter().enumerate().take(MAX_SUGGESTIONS)
+            suggestions.into_iter().enumerate().take(MAX_SUGGESTIONS)
         {
             debug!(?complete, ?parts, ?highlights);
 
-            let has_deletion = parts.iter().any(|p| p.is_deletion(sm));
+            let has_deletion =
+                parts.iter().any(|p| p.is_deletion(sm) || p.is_destructive_replacement(sm));
             let is_multiline = complete.lines().count() > 1;
 
             if i == 0 {
@@ -2166,7 +2170,7 @@ impl HumanEmitter {
                 self.draw_code_line(
                     &mut buffer,
                     &mut row_num,
-                    highlight_parts,
+                    &highlight_parts,
                     line_pos + line_start,
                     line,
                     show_code_change,
@@ -2212,7 +2216,12 @@ impl HumanEmitter {
             if let DisplaySuggestion::Diff | DisplaySuggestion::Underline | DisplaySuggestion::Add =
                 show_code_change
             {
-                for part in parts {
+                for mut part in parts {
+                    // If this is a replacement of, e.g. `"a"` into `"ab"`, adjust the
+                    // suggestion and snippet to look as if we just suggested to add
+                    // `"b"`, which is typically much easier for the user to understand.
+                    part.trim_trivial_replacements(sm);
+
                     let snippet = if let Ok(snippet) = sm.span_to_snippet(part.span) {
                         snippet
                     } else {
@@ -2375,9 +2384,12 @@ impl HumanEmitter {
                 row_num = row + 1;
             }
         }
-        if suggestions.len() > MAX_SUGGESTIONS {
-            let others = suggestions.len() - MAX_SUGGESTIONS;
-            let msg = format!("and {} other candidate{}", others, pluralize!(others));
+        if other_suggestions > 0 {
+            let msg = format!(
+                "and {} other candidate{}",
+                other_suggestions,
+                pluralize!(other_suggestions)
+            );
             buffer.puts(row_num, max_line_num_len + 3, &msg, Style::NoStyle);
         }
 
@@ -2976,7 +2988,7 @@ impl FileWithAnnotatedLines {
     ) -> Vec<FileWithAnnotatedLines> {
         fn add_annotation_to_file(
             file_vec: &mut Vec<FileWithAnnotatedLines>,
-            file: Lrc<SourceFile>,
+            file: Arc<SourceFile>,
             line_index: usize,
             ann: Annotation,
         ) {
@@ -3113,7 +3125,7 @@ impl FileWithAnnotatedLines {
                 //  |        baz
                 add_annotation_to_file(
                     &mut output,
-                    Lrc::clone(&file),
+                    Arc::clone(&file),
                     ann.line_start,
                     ann.as_start(),
                 );
@@ -3140,12 +3152,12 @@ impl FileWithAnnotatedLines {
                     .unwrap_or(ann.line_start);
                 for line in ann.line_start + 1..until {
                     // Every `|` that joins the beginning of the span (`___^`) to the end (`|__^`).
-                    add_annotation_to_file(&mut output, Lrc::clone(&file), line, ann.as_line());
+                    add_annotation_to_file(&mut output, Arc::clone(&file), line, ann.as_line());
                 }
                 let line_end = ann.line_end - 1;
                 let end_is_empty = file.get_line(line_end - 1).is_some_and(|s| !filter(&s));
                 if middle < line_end && !end_is_empty {
-                    add_annotation_to_file(&mut output, Lrc::clone(&file), line_end, ann.as_line());
+                    add_annotation_to_file(&mut output, Arc::clone(&file), line_end, ann.as_line());
                 }
             } else {
                 end_ann.annotation_type = AnnotationType::Singleline;

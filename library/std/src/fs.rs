@@ -664,7 +664,7 @@ impl File {
     /// use std::fs::File;
     ///
     /// fn main() -> std::io::Result<()> {
-    ///     let f = File::open("foo.txt")?;
+    ///     let f = File::create("foo.txt")?;
     ///     f.lock()?;
     ///     Ok(())
     /// }
@@ -767,7 +767,7 @@ impl File {
     /// use std::fs::File;
     ///
     /// fn main() -> std::io::Result<()> {
-    ///     let f = File::open("foo.txt")?;
+    ///     let f = File::create("foo.txt")?;
     ///     f.try_lock()?;
     ///     Ok(())
     /// }
@@ -1229,6 +1229,9 @@ impl Seek for &File {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         self.inner.seek(pos)
     }
+    fn stream_position(&mut self) -> io::Result<u64> {
+        self.inner.tell()
+    }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -1274,6 +1277,9 @@ impl Write for File {
 impl Seek for File {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         (&*self).seek(pos)
+    }
+    fn stream_position(&mut self) -> io::Result<u64> {
+        (&*self).stream_position()
     }
 }
 
@@ -2307,8 +2313,8 @@ impl AsInner<fs_imp::DirEntry> for DirEntry {
 ///
 /// # Platform-specific behavior
 ///
-/// This function currently corresponds to the `unlink` function on Unix
-/// and the `DeleteFile` function on Windows.
+/// This function currently corresponds to the `unlink` function on Unix.
+/// On Windows, `DeleteFile` is used or `CreateFileW` and `SetInformationByHandle` for readonly files.
 /// Note that, this [may change in the future][changes].
 ///
 /// [changes]: io#platform-specific-behavior

@@ -9,10 +9,10 @@
 
 use std::ops::DerefMut;
 use std::panic;
+use std::sync::Arc;
 
 use rustc_data_structures::flat_map_in_place::FlatMapInPlace;
 use rustc_data_structures::stack::ensure_sufficient_stack;
-use rustc_data_structures::sync::Lrc;
 use rustc_span::source_map::Spanned;
 use rustc_span::{Ident, Span};
 use smallvec::{Array, SmallVec, smallvec};
@@ -208,6 +208,10 @@ pub trait MutVisitor: Sized {
 
     fn visit_ty(&mut self, t: &mut P<Ty>) {
         walk_ty(self, t);
+    }
+
+    fn visit_ty_pat(&mut self, t: &mut P<TyPat>) {
+        walk_ty_pat(self, t);
     }
 
     fn visit_lifetime(&mut self, l: &mut Lifetime) {
@@ -570,7 +574,7 @@ pub fn walk_ty<T: MutVisitor>(vis: &mut T, ty: &mut P<Ty>) {
         TyKind::Paren(ty) => vis.visit_ty(ty),
         TyKind::Pat(ty, pat) => {
             vis.visit_ty(ty);
-            vis.visit_pat(pat);
+            vis.visit_ty_pat(pat);
         }
         TyKind::Path(qself, path) => {
             vis.visit_qself(qself);
@@ -589,6 +593,20 @@ pub fn walk_ty<T: MutVisitor>(vis: &mut T, ty: &mut P<Ty>) {
             visit_vec(bounds, |bound| vis.visit_param_bound(bound, BoundKind::Impl));
         }
         TyKind::MacCall(mac) => vis.visit_mac_call(mac),
+    }
+    visit_lazy_tts(vis, tokens);
+    vis.visit_span(span);
+}
+
+pub fn walk_ty_pat<T: MutVisitor>(vis: &mut T, ty: &mut P<TyPat>) {
+    let TyPat { id, kind, span, tokens } = ty.deref_mut();
+    vis.visit_id(id);
+    match kind {
+        TyPatKind::Range(start, end, _include_end) => {
+            visit_opt(start, |c| vis.visit_anon_const(c));
+            visit_opt(end, |c| vis.visit_anon_const(c));
+        }
+        TyPatKind::Err(_) => {}
     }
     visit_lazy_tts(vis, tokens);
     vis.visit_span(span);
@@ -793,14 +811,14 @@ fn visit_tt<T: MutVisitor>(vis: &mut T, tt: &mut TokenTree) {
 // No `noop_` prefix because there isn't a corresponding method in `MutVisitor`.
 fn visit_tts<T: MutVisitor>(vis: &mut T, TokenStream(tts): &mut TokenStream) {
     if T::VISIT_TOKENS && !tts.is_empty() {
-        let tts = Lrc::make_mut(tts);
+        let tts = Arc::make_mut(tts);
         visit_vec(tts, |tree| visit_tt(vis, tree));
     }
 }
 
 fn visit_attr_tts<T: MutVisitor>(vis: &mut T, AttrTokenStream(tts): &mut AttrTokenStream) {
     if T::VISIT_TOKENS && !tts.is_empty() {
-        let tts = Lrc::make_mut(tts);
+        let tts = Arc::make_mut(tts);
         visit_vec(tts, |tree| visit_attr_tt(vis, tree));
     }
 }
@@ -840,7 +858,7 @@ pub fn visit_token<T: MutVisitor>(vis: &mut T, t: &mut Token) {
             vis.visit_ident(ident);
         }
         token::Interpolated(nt) => {
-            let nt = Lrc::make_mut(nt);
+            let nt = Arc::make_mut(nt);
             visit_nonterminal(vis, nt);
         }
         _ => {}

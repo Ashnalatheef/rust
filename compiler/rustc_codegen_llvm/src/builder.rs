@@ -4,7 +4,7 @@ use std::{iter, ptr};
 
 pub(crate) mod autodiff;
 
-use libc::{c_char, c_uint};
+use libc::{c_char, c_uint, size_t};
 use rustc_abi as abi;
 use rustc_abi::{Align, Size, WrappingRange};
 use rustc_codegen_ssa::MemFlags;
@@ -32,7 +32,7 @@ use crate::abi::FnAbiLlvmExt;
 use crate::attributes;
 use crate::common::Funclet;
 use crate::context::{CodegenCx, SimpleCx};
-use crate::llvm::{self, AtomicOrdering, AtomicRmwBinOp, BasicBlock, False, True};
+use crate::llvm::{self, AtomicOrdering, AtomicRmwBinOp, BasicBlock, False, Metadata, True};
 use crate::type_::Type;
 use crate::type_of::LayoutLlvmExt;
 use crate::value::Value;
@@ -333,6 +333,50 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         }
     }
 
+    fn switch_with_weights(
+        &mut self,
+        v: Self::Value,
+        else_llbb: Self::BasicBlock,
+        else_is_cold: bool,
+        cases: impl ExactSizeIterator<Item = (u128, Self::BasicBlock, bool)>,
+    ) {
+        if self.cx.sess().opts.optimize == rustc_session::config::OptLevel::No {
+            self.switch(v, else_llbb, cases.map(|(val, dest, _)| (val, dest)));
+            return;
+        }
+
+        let id_str = "branch_weights";
+        let id = unsafe {
+            llvm::LLVMMDStringInContext2(self.cx.llcx, id_str.as_ptr().cast(), id_str.len())
+        };
+
+        // For switch instructions with 2 targets, the `llvm.expect` intrinsic is used.
+        // This function handles switch instructions with more than 2 targets and it needs to
+        // emit branch weights metadata instead of using the intrinsic.
+        // The values 1 and 2000 are the same as the values used by the `llvm.expect` intrinsic.
+        let cold_weight = unsafe { llvm::LLVMValueAsMetadata(self.cx.const_u32(1)) };
+        let hot_weight = unsafe { llvm::LLVMValueAsMetadata(self.cx.const_u32(2000)) };
+        let weight =
+            |is_cold: bool| -> &Metadata { if is_cold { cold_weight } else { hot_weight } };
+
+        let mut md: SmallVec<[&Metadata; 16]> = SmallVec::with_capacity(cases.len() + 2);
+        md.push(id);
+        md.push(weight(else_is_cold));
+
+        let switch =
+            unsafe { llvm::LLVMBuildSwitch(self.llbuilder, v, else_llbb, cases.len() as c_uint) };
+        for (on_val, dest, is_cold) in cases {
+            let on_val = self.const_uint_big(self.val_ty(v), on_val);
+            unsafe { llvm::LLVMAddCase(switch, on_val, dest) }
+            md.push(weight(is_cold));
+        }
+
+        unsafe {
+            let md_node = llvm::LLVMMDNodeInContext2(self.cx.llcx, md.as_ptr(), md.len() as size_t);
+            self.cx.set_metadata(switch, llvm::MD_prof, md_node);
+        }
+    }
+
     fn invoke(
         &mut self,
         llty: &'ll Type,
@@ -419,6 +463,37 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         unchecked_usub(x, y) => LLVMBuildNUWSub,
         unchecked_smul(x, y) => LLVMBuildNSWMul,
         unchecked_umul(x, y) => LLVMBuildNUWMul,
+    }
+
+    fn unchecked_suadd(&mut self, a: &'ll Value, b: &'ll Value) -> &'ll Value {
+        unsafe {
+            let add = llvm::LLVMBuildAdd(self.llbuilder, a, b, UNNAMED);
+            if llvm::LLVMIsAInstruction(add).is_some() {
+                llvm::LLVMSetNUW(add, True);
+                llvm::LLVMSetNSW(add, True);
+            }
+            add
+        }
+    }
+    fn unchecked_susub(&mut self, a: &'ll Value, b: &'ll Value) -> &'ll Value {
+        unsafe {
+            let sub = llvm::LLVMBuildSub(self.llbuilder, a, b, UNNAMED);
+            if llvm::LLVMIsAInstruction(sub).is_some() {
+                llvm::LLVMSetNUW(sub, True);
+                llvm::LLVMSetNSW(sub, True);
+            }
+            sub
+        }
+    }
+    fn unchecked_sumul(&mut self, a: &'ll Value, b: &'ll Value) -> &'ll Value {
+        unsafe {
+            let mul = llvm::LLVMBuildMul(self.llbuilder, a, b, UNNAMED);
+            if llvm::LLVMIsAInstruction(mul).is_some() {
+                llvm::LLVMSetNUW(mul, True);
+                llvm::LLVMSetNSW(mul, True);
+            }
+            mul
+        }
     }
 
     fn or_disjoint(&mut self, a: &'ll Value, b: &'ll Value) -> &'ll Value {
@@ -543,7 +618,8 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         unsafe {
             let alloca = llvm::LLVMBuildAlloca(bx.llbuilder, ty, UNNAMED);
             llvm::LLVMSetAlignment(alloca, align.bytes() as c_uint);
-            alloca
+            // Cast to default addrspace if necessary
+            llvm::LLVMBuildPointerCast(bx.llbuilder, alloca, self.cx().type_ptr(), UNNAMED)
         }
     }
 
@@ -552,7 +628,8 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
             let alloca =
                 llvm::LLVMBuildArrayAlloca(self.llbuilder, self.cx().type_i8(), size, UNNAMED);
             llvm::LLVMSetAlignment(alloca, align.bytes() as c_uint);
-            alloca
+            // Cast to default addrspace if necessary
+            llvm::LLVMBuildPointerCast(self.llbuilder, alloca, self.cx().type_ptr(), UNNAMED)
         }
     }
 

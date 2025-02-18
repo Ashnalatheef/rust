@@ -148,7 +148,7 @@ impl<'tcx> ConstToPat<'tcx> {
                     if let ty::GenericArgKind::Type(ty) = arg.unpack()
                         && let ty::Param(param_ty) = ty.kind()
                     {
-                        let def_id = self.tcx.hir().enclosing_body_owner(self.id);
+                        let def_id = self.tcx.hir_enclosing_body_owner(self.id);
                         let generics = self.tcx.generics_of(def_id);
                         let param = generics.type_param(*param_ty, self.tcx);
                         let span = self.tcx.def_span(param.def_id);
@@ -208,7 +208,7 @@ impl<'tcx> ConstToPat<'tcx> {
                 let field = FieldIdx::new(idx);
                 // Patterns can only use monomorphic types.
                 let ty = self.tcx.normalize_erasing_regions(self.typing_env, ty);
-                FieldPat { field, pattern: self.valtree_to_pat(val, ty) }
+                FieldPat { field, pattern: *self.valtree_to_pat(val, ty) }
             })
             .collect()
     }
@@ -277,7 +277,7 @@ impl<'tcx> ConstToPat<'tcx> {
                 prefix: cv
                     .unwrap_branch()
                     .iter()
-                    .map(|val| self.valtree_to_pat(*val, *elem_ty))
+                    .map(|val| *self.valtree_to_pat(*val, *elem_ty))
                     .collect(),
                 slice: None,
                 suffix: Box::new([]),
@@ -286,7 +286,7 @@ impl<'tcx> ConstToPat<'tcx> {
                 prefix: cv
                     .unwrap_branch()
                     .iter()
-                    .map(|val| self.valtree_to_pat(*val, *elem_ty))
+                    .map(|val| *self.valtree_to_pat(*val, *elem_ty))
                     .collect(),
                 slice: None,
                 suffix: Box::new([]),

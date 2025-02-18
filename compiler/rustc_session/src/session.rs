@@ -9,9 +9,7 @@ use std::{env, fmt, io};
 use rustc_data_structures::flock;
 use rustc_data_structures::fx::{FxHashMap, FxIndexSet};
 use rustc_data_structures::profiling::{SelfProfiler, SelfProfilerRef};
-use rustc_data_structures::sync::{
-    DynSend, DynSync, Lock, Lrc, MappedReadGuard, ReadGuard, RwLock,
-};
+use rustc_data_structures::sync::{DynSend, DynSync, Lock, MappedReadGuard, ReadGuard, RwLock};
 use rustc_errors::annotate_snippet_emitter_writer::AnnotateSnippetEmitter;
 use rustc_errors::codes::*;
 use rustc_errors::emitter::{
@@ -69,6 +67,11 @@ impl Limit {
         Limit(value)
     }
 
+    /// Create a new unlimited limit.
+    pub fn unlimited() -> Self {
+        Limit(usize::MAX)
+    }
+
     /// Check that `value` is within the limit. Ensures that the same comparisons are used
     /// throughout the compiler, as mismatches can cause ICEs, see #72540.
     #[inline]
@@ -121,6 +124,8 @@ pub struct Limits {
     pub move_size_limit: Limit,
     /// The maximum length of types during monomorphization.
     pub type_length_limit: Limit,
+    /// The maximum pattern complexity allowed (internal only).
+    pub pattern_complexity_limit: Limit,
 }
 
 pub struct CompilerIO {
@@ -138,8 +143,8 @@ pub struct Session {
     pub target: Target,
     pub host: Target,
     pub opts: config::Options,
-    pub host_tlib_path: Lrc<SearchPath>,
-    pub target_tlib_path: Lrc<SearchPath>,
+    pub host_tlib_path: Arc<SearchPath>,
+    pub target_tlib_path: Arc<SearchPath>,
     pub psess: ParseSess,
     pub sysroot: PathBuf,
     /// Input, input file path and output file path to this compilation process.
@@ -154,7 +159,7 @@ pub struct Session {
     pub code_stats: CodeStats,
 
     /// This only ever stores a `LintStore` but we don't want a dependency on that type here.
-    pub lint_store: Option<Lrc<dyn LintStoreMarker>>,
+    pub lint_store: Option<Arc<dyn LintStoreMarker>>,
 
     /// Cap lint level specified by a driver specifically.
     pub driver_lint_caps: FxHashMap<lint::LintId, lint::Level>,
@@ -885,8 +890,8 @@ impl Session {
 #[allow(rustc::bad_opt_access)]
 fn default_emitter(
     sopts: &config::Options,
-    source_map: Lrc<SourceMap>,
-    bundle: Option<Lrc<FluentBundle>>,
+    source_map: Arc<SourceMap>,
+    bundle: Option<Arc<FluentBundle>>,
     fallback_bundle: LazyFallbackBundle,
 ) -> Box<DynEmitter> {
     let macro_backtrace = sopts.unstable_opts.macro_backtrace;
@@ -967,10 +972,9 @@ fn default_emitter(
 #[allow(rustc::bad_opt_access)]
 #[allow(rustc::untranslatable_diagnostic)] // FIXME: make this translatable
 pub fn build_session(
-    early_dcx: EarlyDiagCtxt,
     sopts: config::Options,
     io: CompilerIO,
-    bundle: Option<Lrc<rustc_errors::FluentBundle>>,
+    bundle: Option<Arc<rustc_errors::FluentBundle>>,
     registry: rustc_errors::registry::Registry,
     fluent_resources: Vec<&'static str>,
     driver_lint_caps: FxHashMap<lint::LintId, lint::Level>,
@@ -992,20 +996,12 @@ pub fn build_session(
     let cap_lints_allow = sopts.lint_cap.is_some_and(|cap| cap == lint::Allow);
     let can_emit_warnings = !(warnings_allow || cap_lints_allow);
 
-    let host_triple = TargetTuple::from_tuple(config::host_tuple());
-    let (host, target_warnings) = Target::search(&host_triple, &sysroot).unwrap_or_else(|e| {
-        early_dcx.early_fatal(format!("Error loading host specification: {e}"))
-    });
-    for warning in target_warnings.warning_messages() {
-        early_dcx.early_warn(warning)
-    }
-
     let fallback_bundle = fallback_fluent_bundle(
         fluent_resources,
         sopts.unstable_opts.translate_directionality_markers,
     );
     let source_map = rustc_span::source_map::get_source_map().unwrap();
-    let emitter = default_emitter(&sopts, Lrc::clone(&source_map), bundle, fallback_bundle);
+    let emitter = default_emitter(&sopts, Arc::clone(&source_map), bundle, fallback_bundle);
 
     let mut dcx = DiagCtxt::new(emitter)
         .with_flags(sopts.unstable_opts.dcx_flags(can_emit_warnings))
@@ -1014,9 +1010,12 @@ pub fn build_session(
         dcx = dcx.with_ice_file(ice_file);
     }
 
-    // Now that the proper handler has been constructed, drop early_dcx to
-    // prevent accidental use.
-    drop(early_dcx);
+    let host_triple = TargetTuple::from_tuple(config::host_tuple());
+    let (host, target_warnings) = Target::search(&host_triple, &sysroot)
+        .unwrap_or_else(|e| dcx.handle().fatal(format!("Error loading host specification: {e}")));
+    for warning in target_warnings.warning_messages() {
+        dcx.handle().warn(warning)
+    }
 
     let self_profiler = if let SwitchWithOptPath::Enabled(ref d) = sopts.unstable_opts.self_profile
     {
@@ -1045,13 +1044,13 @@ pub fn build_session(
 
     let host_triple = config::host_tuple();
     let target_triple = sopts.target_triple.tuple();
-    let host_tlib_path = Lrc::new(SearchPath::from_sysroot_and_triple(&sysroot, host_triple));
+    let host_tlib_path = Arc::new(SearchPath::from_sysroot_and_triple(&sysroot, host_triple));
     let target_tlib_path = if host_triple == target_triple {
         // Use the same `SearchPath` if host and target triple are identical to avoid unnecessary
         // rescanning of the target lib path and an unnecessary allocation.
-        Lrc::clone(&host_tlib_path)
+        Arc::clone(&host_tlib_path)
     } else {
-        Lrc::new(SearchPath::from_sysroot_and_triple(&sysroot, target_triple))
+        Arc::new(SearchPath::from_sysroot_and_triple(&sysroot, target_triple))
     };
 
     let prof = SelfProfilerRef::new(
@@ -1259,7 +1258,8 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
     }
 
     if let Some(dwarf_version) = sess.opts.unstable_opts.dwarf_version {
-        if dwarf_version > 5 {
+        // DWARF 1 is not supported by LLVM and DWARF 6 is not yet finalized.
+        if dwarf_version < 2 || dwarf_version > 5 {
             sess.dcx().emit_err(errors::UnsupportedDwarfVersion { dwarf_version });
         }
     }
@@ -1446,7 +1446,7 @@ fn mk_emitter(output: ErrorOutputType) -> Box<DynEmitter> {
         config::ErrorOutputType::Json { pretty, json_rendered, color_config } => {
             Box::new(JsonEmitter::new(
                 Box::new(io::BufWriter::new(io::stderr())),
-                Some(Lrc::new(SourceMap::new(FilePathMapping::empty()))),
+                Some(Arc::new(SourceMap::new(FilePathMapping::empty()))),
                 fallback_bundle,
                 pretty,
                 json_rendered,

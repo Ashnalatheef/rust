@@ -576,7 +576,7 @@ impl<'cx, 'tcx> UniversalRegionsBuilder<'cx, 'tcx> {
         let tcx = self.infcx.tcx;
         let typeck_root_def_id = tcx.typeck_root_def_id(self.mir_def.to_def_id());
 
-        match tcx.hir().body_owner_kind(self.mir_def) {
+        match tcx.hir_body_owner_kind(self.mir_def) {
             BodyOwnerKind::Closure | BodyOwnerKind::Fn => {
                 let defining_ty = tcx.type_of(self.mir_def).instantiate_identity();
 
@@ -620,10 +620,10 @@ impl<'cx, 'tcx> UniversalRegionsBuilder<'cx, 'tcx> {
                     let ty = tcx
                         .typeck(self.mir_def)
                         .node_type(tcx.local_def_id_to_hir_id(self.mir_def));
-                    let args = InlineConstArgs::new(tcx, InlineConstArgsParts {
-                        parent_args: identity_args,
-                        ty,
-                    })
+                    let args = InlineConstArgs::new(
+                        tcx,
+                        InlineConstArgsParts { parent_args: identity_args, ty },
+                    )
                     .args;
                     let args = self.infcx.replace_free_regions_with_nll_infer_vars(FR, args);
                     DefiningTy::InlineConst(self.mir_def.to_def_id(), args)

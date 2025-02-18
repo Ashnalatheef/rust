@@ -42,6 +42,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::{fmt, io};
 
+use rustc_abi::{Endian, ExternAbi, Integer, Size, TargetDataLayout, TargetDataLayoutErrors};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_fs_util::try_canonicalize;
 use rustc_macros::{Decodable, Encodable, HashStable_Generic};
@@ -50,20 +51,11 @@ use rustc_span::{Symbol, kw, sym};
 use serde_json::Value;
 use tracing::debug;
 
-use crate::abi::call::Conv;
-use crate::abi::{Endian, Integer, Size, TargetDataLayout, TargetDataLayoutErrors};
+use crate::callconv::Conv;
 use crate::json::{Json, ToJson};
-use crate::spec::abi::Abi;
 use crate::spec::crt_objects::CrtObjects;
 
 pub mod crt_objects;
-
-pub mod abi {
-    pub use rustc_abi::{
-        AbiDisabled, AbiUnsupported, ExternAbi as Abi, all_names, enabled_names, is_enabled,
-        is_stable, lookup,
-    };
-}
 
 mod base;
 mod json;
@@ -1117,6 +1109,8 @@ impl ToJson for FloatAbi {
 /// The Rustc-specific variant of the ABI used for this target.
 #[derive(Clone, Copy, PartialEq, Hash, Debug)]
 pub enum RustcAbi {
+    /// On x86-32 only: make use of SSE and SSE2 for ABI purposes.
+    X86Sse2,
     /// On x86-32/64 only: do not use any FPU or SIMD registers for the ABI.
     X86Softfloat,
 }
@@ -1126,6 +1120,7 @@ impl FromStr for RustcAbi {
 
     fn from_str(s: &str) -> Result<RustcAbi, ()> {
         Ok(match s {
+            "x86-sse2" => RustcAbi::X86Sse2,
             "x86-softfloat" => RustcAbi::X86Softfloat,
             _ => return Err(()),
         })
@@ -1135,6 +1130,7 @@ impl FromStr for RustcAbi {
 impl ToJson for RustcAbi {
     fn to_json(&self) -> Json {
         match *self {
+            RustcAbi::X86Sse2 => "x86-sse2",
             RustcAbi::X86Softfloat => "x86-softfloat",
         }
         .to_json()
@@ -1651,7 +1647,7 @@ macro_rules! supported_targets {
         }
 
         /// List of supported targets
-        pub const TARGETS: &[&str] = &[$($tuple),+];
+        pub static TARGETS: &[&str] = &[$($tuple),+];
 
         fn load_builtin(target: &str) -> Option<Target> {
             let t = match target {
@@ -1660,6 +1656,14 @@ macro_rules! supported_targets {
             };
             debug!("got builtin target: {:?}", t);
             Some(t)
+        }
+
+        fn load_all_builtins() -> impl Iterator<Item = Target> {
+            [
+                $( targets::$module::target, )+
+            ]
+            .into_iter()
+            .map(|f| f())
         }
 
         #[cfg(test)]
@@ -1798,7 +1802,7 @@ supported_targets! {
     ("x86_64-unknown-l4re-uclibc", x86_64_unknown_l4re_uclibc),
 
     ("aarch64-unknown-redox", aarch64_unknown_redox),
-    ("i686-unknown-redox", i686_unknown_redox),
+    ("i586-unknown-redox", i586_unknown_redox),
     ("x86_64-unknown-redox", x86_64_unknown_redox),
 
     ("i386-apple-ios", i386_apple_ios),
@@ -1935,6 +1939,8 @@ supported_targets! {
 
     ("nvptx64-nvidia-cuda", nvptx64_nvidia_cuda),
 
+    ("amdgcn-amd-amdhsa", amdgcn_amd_amdhsa),
+
     ("xtensa-esp32-none-elf", xtensa_esp32_none_elf),
     ("xtensa-esp32-espidf", xtensa_esp32_espidf),
     ("xtensa-esp32s2-none-elf", xtensa_esp32s2_none_elf),
@@ -2019,6 +2025,7 @@ supported_targets! {
     ("riscv64imac-unknown-nuttx-elf", riscv64imac_unknown_nuttx_elf),
     ("riscv64gc-unknown-nuttx-elf", riscv64gc_unknown_nuttx_elf),
 
+    ("x86_64-pc-cygwin", x86_64_pc_cygwin),
 }
 
 /// Cow-Vec-Str: Cow<'static, [Cow<'static, str>]>
@@ -2845,44 +2852,40 @@ impl DerefMut for Target {
 
 impl Target {
     /// Given a function ABI, turn it into the correct ABI for this target.
-    pub fn adjust_abi(&self, abi: Abi, c_variadic: bool) -> Abi {
+    pub fn adjust_abi(&self, abi: ExternAbi, c_variadic: bool) -> ExternAbi {
+        use ExternAbi::*;
         match abi {
             // On Windows, `extern "system"` behaves like msvc's `__stdcall`.
             // `__stdcall` only applies on x86 and on non-variadic functions:
             // https://learn.microsoft.com/en-us/cpp/cpp/stdcall?view=msvc-170
-            Abi::System { unwind } if self.is_like_windows && self.arch == "x86" && !c_variadic => {
-                Abi::Stdcall { unwind }
+            System { unwind } if self.is_like_windows && self.arch == "x86" && !c_variadic => {
+                Stdcall { unwind }
             }
-            Abi::System { unwind } => Abi::C { unwind },
-            Abi::EfiApi if self.arch == "arm" => Abi::Aapcs { unwind: false },
-            Abi::EfiApi if self.arch == "x86_64" => Abi::Win64 { unwind: false },
-            Abi::EfiApi => Abi::C { unwind: false },
+            System { unwind } => C { unwind },
+            EfiApi if self.arch == "arm" => Aapcs { unwind: false },
+            EfiApi if self.arch == "x86_64" => Win64 { unwind: false },
+            EfiApi => C { unwind: false },
 
-            // See commentary in `is_abi_supported`: we map these ABIs to "C" when they do not make sense.
-            Abi::Stdcall { .. } | Abi::Thiscall { .. } | Abi::Fastcall { .. }
-                if self.arch == "x86" =>
-            {
-                abi
-            }
-            Abi::Vectorcall { .. } if ["x86", "x86_64"].contains(&&self.arch[..]) => abi,
-            Abi::Stdcall { unwind }
-            | Abi::Thiscall { unwind }
-            | Abi::Fastcall { unwind }
-            | Abi::Vectorcall { unwind } => Abi::C { unwind },
+            // See commentary in `is_abi_supported`.
+            Stdcall { .. } | Thiscall { .. } if self.arch == "x86" => abi,
+            Stdcall { unwind } | Thiscall { unwind } => C { unwind },
+            Fastcall { .. } if self.arch == "x86" => abi,
+            Vectorcall { .. } if ["x86", "x86_64"].contains(&&self.arch[..]) => abi,
+            Fastcall { unwind } | Vectorcall { unwind } => C { unwind },
 
             // The Windows x64 calling convention we use for `extern "Rust"`
             // <https://learn.microsoft.com/en-us/cpp/build/x64-software-conventions#register-volatility-and-preservation>
             // expects the callee to save `xmm6` through `xmm15`, but `PreserveMost`
             // (that we use by default for `extern "rust-cold"`) doesn't save any of those.
             // So to avoid bloating callers, just use the Rust convention here.
-            Abi::RustCold if self.is_like_windows && self.arch == "x86_64" => Abi::Rust,
+            RustCold if self.is_like_windows && self.arch == "x86_64" => Rust,
 
             abi => abi,
         }
     }
 
-    pub fn is_abi_supported(&self, abi: Abi) -> bool {
-        use Abi::*;
+    pub fn is_abi_supported(&self, abi: ExternAbi) -> bool {
+        use ExternAbi::*;
         match abi {
             Rust
             | C { .. }
@@ -3004,8 +3007,8 @@ impl Target {
         );
         check_eq!(
             self.is_like_windows,
-            self.os == "windows" || self.os == "uefi",
-            "`is_like_windows` must be set if and only if `os` is `windows` or `uefi`"
+            self.os == "windows" || self.os == "uefi" || self.os == "cygwin",
+            "`is_like_windows` must be set if and only if `os` is `windows`, `uefi` or `cygwin`"
         );
         check_eq!(
             self.is_like_wasm,
@@ -3273,6 +3276,11 @@ impl Target {
         // Check consistency of Rust ABI declaration.
         if let Some(rust_abi) = self.rustc_abi {
             match rust_abi {
+                RustcAbi::X86Sse2 => check_matches!(
+                    &*self.arch,
+                    "x86",
+                    "`x86-sse2` ABI is only valid for x86-32 targets"
+                ),
                 RustcAbi::X86Softfloat => check_matches!(
                     &*self.arch,
                     "x86" | "x86_64",
@@ -3358,6 +3366,11 @@ impl Target {
                 panic!("built-in targets doesn't support target-paths")
             }
         }
+    }
+
+    /// Load all built-in targets
+    pub fn builtins() -> impl Iterator<Item = Target> {
+        load_all_builtins()
     }
 
     /// Search for a JSON file specifying the given target tuple.

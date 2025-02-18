@@ -238,7 +238,7 @@ impl<'a, 'tcx> InspectCandidate<'a, 'tcx> {
                 // constraints, we get an ICE if we already applied the constraints
                 // from the chosen candidate.
                 let proof_tree = infcx
-                    .probe(|_| infcx.evaluate_root_goal(goal, GenerateProofTree::Yes).1)
+                    .probe(|_| infcx.evaluate_root_goal(goal, GenerateProofTree::Yes, span).1)
                     .unwrap();
                 InspectGoal::new(infcx, self.goal.depth + 1, proof_tree, None, source)
             }
@@ -300,7 +300,6 @@ impl<'a, 'tcx> InspectGoal<'a, 'tcx> {
                         inspect::ProbeKind::NormalizedSelfTyAssembly
                         | inspect::ProbeKind::UnsizeAssembly
                         | inspect::ProbeKind::Root { .. }
-                        | inspect::ProbeKind::TryNormalizeNonRigid { .. }
                         | inspect::ProbeKind::TraitCandidate { .. }
                         | inspect::ProbeKind::OpaqueTypeStorageLookup { .. }
                         | inspect::ProbeKind::RigidAlias { .. } => {
@@ -325,7 +324,6 @@ impl<'a, 'tcx> InspectGoal<'a, 'tcx> {
             // We add a candidate even for the root evaluation if there
             // is only one way to prove a given goal, e.g. for `WellFormed`.
             inspect::ProbeKind::Root { result }
-            | inspect::ProbeKind::TryNormalizeNonRigid { result }
             | inspect::ProbeKind::TraitCandidate { source: _, result }
             | inspect::ProbeKind::OpaqueTypeStorageLookup { result }
             | inspect::ProbeKind::RigidAlias { result } => {
@@ -440,8 +438,11 @@ impl<'tcx> InferCtxt<'tcx> {
         depth: usize,
         visitor: &mut V,
     ) -> V::Result {
-        let (_, proof_tree) =
-            <&SolverDelegate<'tcx>>::from(self).evaluate_root_goal(goal, GenerateProofTree::Yes);
+        let (_, proof_tree) = <&SolverDelegate<'tcx>>::from(self).evaluate_root_goal(
+            goal,
+            GenerateProofTree::Yes,
+            visitor.span(),
+        );
         let proof_tree = proof_tree.unwrap();
         visitor.visit_goal(&InspectGoal::new(self, depth, proof_tree, None, GoalSource::Misc))
     }

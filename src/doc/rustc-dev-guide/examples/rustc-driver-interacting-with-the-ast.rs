@@ -15,9 +15,9 @@ extern crate rustc_span;
 
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 use rustc_ast_pretty::pprust::item_to_string;
-use rustc_data_structures::sync::Lrc;
 use rustc_driver::{Compilation, run_compiler};
 use rustc_interface::interface::{Compiler, Config};
 use rustc_middle::ty::TyCtxt;
@@ -43,7 +43,7 @@ fn main() {
         }
     }
 
-    fn read_binary_file(&self, _path: &Path) -> io::Result<Lrc<[u8]>> {
+    fn read_binary_file(&self, _path: &Path) -> io::Result<Arc<[u8]>> {
         Err(io::Error::other("oops"))
     }
 }
@@ -75,7 +75,7 @@ impl rustc_driver::Callbacks for MyCallbacks {
             let item = hir_krate.item(id);
             // Use pattern-matching to find a specific node inside the main function.
             if let rustc_hir::ItemKind::Fn(_, _, body_id) = item.kind {
-                let expr = &tcx.hir().body(body_id).value;
+                let expr = &tcx.hir_body(body_id).value;
                 if let rustc_hir::ExprKind::Block(block, _) = expr.kind {
                     if let rustc_hir::StmtKind::Let(let_stmt) = block.stmts[0].kind {
                         if let Some(expr) = let_stmt.init {

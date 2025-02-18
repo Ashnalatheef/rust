@@ -18,7 +18,6 @@ use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
 use rustc_data_structures::sorted_map::SortedMap;
 use rustc_data_structures::steal::Steal;
 use rustc_data_structures::svh::Svh;
-use rustc_data_structures::sync::Lrc;
 use rustc_data_structures::unord::{UnordMap, UnordSet};
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def::{DefKind, DocLinkResMap};
@@ -117,7 +116,7 @@ rustc_queries! {
     }
 
     query early_lint_checks(_: ()) {
-        desc { "perform lints prior to macro expansion" }
+        desc { "perform lints prior to AST lowering" }
     }
 
     query resolutions(_: ()) -> &'tcx ty::ResolverGlobalCtxt {
@@ -125,7 +124,7 @@ rustc_queries! {
         desc { "getting the resolver outputs" }
     }
 
-    query resolver_for_lowering_raw(_: ()) -> (&'tcx Steal<(ty::ResolverAstLowering, Lrc<ast::Crate>)>, &'tcx ty::ResolverGlobalCtxt) {
+    query resolver_for_lowering_raw(_: ()) -> (&'tcx Steal<(ty::ResolverAstLowering, Arc<ast::Crate>)>, &'tcx ty::ResolverGlobalCtxt) {
         eval_always
         no_hash
         desc { "getting the resolver for lowering" }
@@ -164,7 +163,7 @@ rustc_queries! {
 
     /// The items in a module.
     ///
-    /// This can be conveniently accessed by `tcx.hir().visit_item_likes_in_module`.
+    /// This can be conveniently accessed by `tcx.hir_visit_item_likes_in_module`.
     /// Avoid calling this query directly.
     query hir_module_items(key: LocalModDefId) -> &'tcx rustc_middle::hir::ModuleItems {
         arena_cache
@@ -615,9 +614,16 @@ rustc_queries! {
         feedable
     }
 
-    /// Summarizes coverage IDs inserted by the `InstrumentCoverage` MIR pass
-    /// (for compiler option `-Cinstrument-coverage`), after MIR optimizations
-    /// have had a chance to potentially remove some of them.
+    /// Scans through a function's MIR after MIR optimizations, to prepare the
+    /// information needed by codegen when `-Cinstrument-coverage` is active.
+    ///
+    /// This includes the details of where to insert `llvm.instrprof.increment`
+    /// intrinsics, and the expression tables to be embedded in the function's
+    /// coverage metadata.
+    ///
+    /// FIXME(Zalathar): This query's purpose has drifted a bit and should
+    /// probably be renamed, but that can wait until after the potential
+    /// follow-ups to #136053 have settled down.
     ///
     /// Returns `None` for functions that were not instrumented.
     query coverage_ids_info(key: ty::InstanceKind<'tcx>) -> Option<&'tcx mir::coverage::CoverageIdsInfo> {
@@ -765,7 +771,7 @@ rustc_queries! {
     query type_param_predicates(
         key: (LocalDefId, LocalDefId, rustc_span::Ident)
     ) -> ty::EarlyBinder<'tcx, &'tcx [(ty::Clause<'tcx>, Span)]> {
-        desc { |tcx| "computing the bounds for type parameter `{}`", tcx.hir().ty_param_name(key.1) }
+        desc { |tcx| "computing the bounds for type parameter `{}`", tcx.hir_ty_param_name(key.1) }
     }
 
     query trait_def(key: DefId) -> &'tcx ty::TraitDef {
@@ -1628,7 +1634,7 @@ rustc_queries! {
         separate_provide_extern
     }
 
-    query dependency_formats(_: ()) -> &'tcx Lrc<crate::middle::dependency_format::Dependencies> {
+    query dependency_formats(_: ()) -> &'tcx Arc<crate::middle::dependency_format::Dependencies> {
         arena_cache
         desc { "getting the linkage format of all dependencies" }
     }
@@ -2077,7 +2083,7 @@ rustc_queries! {
         desc { "seeing if we're missing an `extern crate` item for this crate" }
         separate_provide_extern
     }
-    query used_crate_source(_: CrateNum) -> &'tcx Lrc<CrateSource> {
+    query used_crate_source(_: CrateNum) -> &'tcx Arc<CrateSource> {
         arena_cache
         eval_always
         desc { "looking at the source for a crate" }

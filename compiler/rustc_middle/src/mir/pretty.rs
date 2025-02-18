@@ -5,17 +5,16 @@ use std::{fs, io};
 
 use rustc_abi::Size;
 use rustc_ast::InlineAsmTemplatePiece;
-use rustc_middle::mir::interpret::{
-    AllocBytes, AllocId, Allocation, GlobalAlloc, Pointer, Provenance, alloc_range,
-    read_target_uint,
-};
-use rustc_middle::mir::visit::Visitor;
-use rustc_middle::mir::*;
 use tracing::trace;
 use ty::print::PrettyPrinter;
 
 use super::graphviz::write_mir_fn_graphviz;
-use crate::mir::interpret::ConstAllocation;
+use crate::mir::interpret::{
+    AllocBytes, AllocId, Allocation, ConstAllocation, GlobalAlloc, Pointer, Provenance,
+    alloc_range, read_target_uint,
+};
+use crate::mir::visit::Visitor;
+use crate::mir::*;
 
 const INDENT: &str = "    ";
 /// Alignment for lining up comments following MIR statements
@@ -619,13 +618,9 @@ fn write_function_coverage_info(
     function_coverage_info: &coverage::FunctionCoverageInfo,
     w: &mut dyn io::Write,
 ) -> io::Result<()> {
-    let coverage::FunctionCoverageInfo { body_span, expressions, mappings, .. } =
-        function_coverage_info;
+    let coverage::FunctionCoverageInfo { body_span, mappings, .. } = function_coverage_info;
 
     writeln!(w, "{INDENT}coverage body span: {body_span:?}")?;
-    for (id, expression) in expressions.iter_enumerated() {
-        writeln!(w, "{INDENT}coverage {id:?} => {expression:?};")?;
-    }
     for coverage::Mapping { kind, span } in mappings {
         writeln!(w, "{INDENT}coverage {kind:?} => {span:?};")?;
     }
@@ -1593,7 +1588,7 @@ pub fn write_allocations<'tcx>(
             Some(GlobalAlloc::Static(did)) if !tcx.is_foreign_item(did) => {
                 write!(w, " (static: {}", tcx.def_path_str(did))?;
                 if body.phase <= MirPhase::Runtime(RuntimePhase::PostCleanup)
-                    && tcx.hir().body_const_context(body.source.def_id()).is_some()
+                    && tcx.hir_body_const_context(body.source.def_id()).is_some()
                 {
                     // Statics may be cyclic and evaluating them too early
                     // in the MIR pipeline may cause cycle errors even though
